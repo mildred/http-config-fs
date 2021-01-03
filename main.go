@@ -159,6 +159,8 @@ func main() {
 	flat := flag.Bool("flat", false, "Consider there is no directories (one level hierarchy only)")
 	extensions := flag.Bool("extensions", false, "Consider directories are the files without extension")
 	file := flag.String("file", "", "Export a single URL as this file name under mount path")
+	foreground := flag.Bool("f", false, "Run in foreground")
+	umount := flag.Bool("u", true, "Umount before mounting a new filesystem")
 	flag.Parse()
 	if len(flag.Args()) < 1 {
 		log.Fatal("Usage: http-config-fs <http url> <mount point>")
@@ -174,7 +176,35 @@ func main() {
 		logd.SetOutput(ioutil.Discard)
 	}
 
-	exec.Command("/bin/fusermount", "-uz", flag.Arg(1)).Run()
+	if !*foreground {
+		self, err := os.Readlink("/proc/self/exe")
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+		child := exec.Command(self)
+		child.Args = nil
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		child.Stdin = os.Stdin
+		for i, arg := range os.Args {
+			child.Args = append(child.Args, arg)
+			if i == len(os.Args)-3 {
+				child.Args = append(child.Args, "-f")
+			}
+		}
+		logd.Printf("Start %v", child)
+		err = child.Start()
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if *umount {
+		exec.Command("/bin/fusermount", "-uz", flag.Arg(1)).Run()
+	}
 
 	srcURL, err := url.Parse(flag.Arg(0))
 	if err != nil {
