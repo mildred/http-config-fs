@@ -1,306 +1,202 @@
 package main
 
 import (
-	"io"
+	"context"
+	"flag"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
-	"strconv"
 	"strings"
-	"sync"
+	"syscall"
 
-	"github.com/PuerkitoBio/goquery"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/hanwen/go-fuse/fuse"
-	"github.com/hanwen/go-fuse/fuse/nodefs"
-	"github.com/hanwen/go-fuse/fuse/pathfs"
-	"github.com/ogier/pflag"
-	"github.com/superp00t/etc"
-	"github.com/superp00t/etc/yo"
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-type IndexFS struct {
-	pathfs.FileSystem
+var logv *log.Logger
+var logd *log.Logger
 
-	sizes *sync.Map
-	hpath string
-	c     *http.Client
+func isDirRedirect(url, location *url.URL) (result bool) {
+	result = url.Host == location.Host &&
+		url.Path+"/" == location.Path
+	logd.Printf("isDirRedirect(%v, %v) = %v", url, location, result)
+	return
 }
 
-func (i *IndexFS) loadSize(name string) int64 {
-	s, ok := i.sizes.Load(name)
-	if !ok {
-		return -1
-	}
+var HttpClientNoRedirects *http.Client
 
-	return s.(int64)
+type httpHandle struct {
+	resp       *http.Response
+	hasContent bool
+	content    []byte
+	contentErr syscall.Errno
 }
 
-/* HTTP Methods
-   ============
-*/
-func (i *IndexFS) head(url string) int64 {
-	yo.Println("HEAD", url)
-	r, err := http.NewRequest("HEAD", url, nil)
-	if err != nil {
-		yo.Println(err)
-		return -1
-	}
+func (fh *httpHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	logv.Printf("Read(seek=%d, len=%d)", off, len(dest))
 
-	rsp, err := i.c.Do(r)
-	if err != nil {
-		yo.Println(err)
-		return -1
-	}
-
-	yo.Println(url, rsp.Status)
-
-	if rsp.StatusCode == 301 {
-		yo.Println("Redirect")
-		return -2
-	}
-
-	if rsp.StatusCode != 200 {
-		yo.Println("invalid code", rsp.Status)
-		return -1
-	}
-
-	n := rsp.ContentLength
-	yo.Println("Content length", n)
-
-	if rsp.StatusCode == 200 && n == -1 {
-		return -2
-	}
-
-	return n
-}
-
-func pathEscape(str string) string {
-	return strings.Replace(
-		strings.Replace(
-			url.QueryEscape(str),
-			"%2F",
-			"/",
-			-1,
-		), "+", "%20", -1)
-}
-
-func (i *IndexFS) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
-	dirAttr := &fuse.Attr{
-		Mode: fuse.S_IFDIR | 0644,
-	}
-	if name == "" {
-		return dirAttr, fuse.OK
-	}
-	szi, ok := i.sizes.Load(name)
-	if !ok {
-		g := i.head(i.hpath + "/" + pathEscape(name))
-		if g == -2 {
-			return dirAttr, fuse.OK
-		}
-
-		if g == -1 {
-			return nil, fuse.ENOENT
-		}
-
-		i.sizes.Store(name, g)
-
-		return &fuse.Attr{
-			Mode: fuse.S_IFREG | 0644,
-			Size: uint64(g),
-		}, fuse.OK
-	}
-
-	sz := szi.(int64)
-
-	if sz == -1 {
-		return dirAttr, fuse.OK
-	}
-
-	return &fuse.Attr{
-		Mode: fuse.S_IFREG | 0644,
-		Size: uint64(sz),
-	}, fuse.OK
-}
-
-func parseList(s string) []int64 {
-	i := etc.FromString(s)
-
-	o := []int64{0}
-
-	_, err := i.ReadUntilToken("<pre><a href=\"../\">../</a>")
-	if err != nil {
-		yo.Fatal(err)
-		return o
-	}
-
-	for {
-		i.ReadUntilToken("</a>")
-
-		_, err = i.ReadUntilToken(":")
+	if !fh.hasContent {
+		var err error
+		fh.content, err = ioutil.ReadAll(fh.resp.Body)
+		fh.hasContent = true
 		if err != nil {
-			yo.Warn(err)
-			break
+			fh.contentErr = syscall.EIO
 		}
+	}
 
-		yo.Println(i.ReadFixedString(2))
+	if fh.contentErr != 0 {
+		return nil, fh.contentErr
+	}
 
-		szStr, err := i.ReadUntilToken("\r\n")
+	end := off + int64(len(dest))
+	if end > int64(len(fh.content)) {
+		end = int64(len(fh.content))
+	}
+
+	// We could copy to the `dest` buffer, but since we have a
+	// []byte already, return that.
+	return fuse.ReadResultData(fh.content[off:end]), 0
+}
+
+var _ = (fs.FileReader)((*httpHandle)(nil))
+
+type urlNode struct {
+	fs.Inode
+	Flat       bool
+	Extensions bool
+	URL        *url.URL
+}
+
+// Lookup is part of the NodeLookuper interface
+func (n *urlNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	logv.Printf("Lookup(node=%s, name=%s)", n.URL.String(), name)
+	url, err := n.URL.Parse(name)
+	if err != nil {
+		return nil, syscall.ENOENT
+	}
+
+	var mode uint32 = fuse.S_IFREG
+	if n.Extensions && !strings.Contains(name, ".") {
+		mode = fuse.S_IFDIR
+	} else if !n.Flat {
+		resp, err := HttpClientNoRedirects.Head(url.String())
 		if err != nil {
-			break
-		}
-
-		szStr = strings.TrimLeft(szStr, " ")
-		szStr = strings.TrimRight(szStr, " ")
-
-		if szStr == "-" {
-			o = append(o, 4)
-		} else {
-			i, err := strconv.ParseInt(szStr, 0, 64)
-			if err != nil {
-				yo.Println(`"` + szStr + `"`)
-				panic(err)
-			}
-
-			o = append(o, i)
+			log.Printf("Lookup(url=%v) error: %e", url, err)
+		} else if loc, err := resp.Location(); err == nil && isDirRedirect(url, loc) {
+			logv.Printf("Lookup(url=%v) detected as directory: redirect to %s", url, loc)
+			mode = fuse.S_IFDIR
 		}
 	}
 
-	yo.Println(spew.Sdump(o))
-	return o
+	if mode == fuse.S_IFDIR {
+		url.Path = url.Path + "/"
+	}
+
+	stable := fs.StableAttr{
+		Mode: mode,
+	}
+	operations := &urlNode{URL: url}
+
+	// The NewInode call wraps the `operations` object into an Inode.
+	child := n.NewInode(ctx, operations, stable)
+
+	// In case of concurrent lookup requests, it can happen that operations !=
+	// child.Operations().
+	return child, 0
 }
 
-func (me *IndexFS) OpenDir(name string, context *fuse.Context) (c []fuse.DirEntry, code fuse.Status) {
-	trp := me.hpath + "/" + pathEscape(name)
+func (n *urlNode) Open(ctx context.Context, openFlags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	logv.Printf("Open(node=%s)", n.URL.String())
 
-	r, err := http.NewRequest("GET", trp, nil)
+	// disallow writes
+	if fuseFlags&(syscall.O_RDWR|syscall.O_WRONLY) != 0 {
+		return nil, 0, syscall.EROFS
+	}
+
+	// Make request
+	resp, err := http.Get(n.URL.String())
+	err_no := syscall.Errno(0)
+
 	if err != nil {
-		return nil, fuse.ENOENT
+		log.Printf("Error in Open(node=%s): %e", n.URL.String(), err)
+		err_no = syscall.EIO
 	}
 
-	yo.Println("(OpenDir) GET", trp)
-
-	rsp, err := me.c.Do(r)
-	if err != nil {
-		return nil, fuse.ENOENT
+	fh = &httpHandle{
+		resp:       resp,
+		hasContent: err_no != 0,
+		content:    []byte{},
+		contentErr: err_no,
 	}
 
-	dirBuffer := etc.NewBuffer()
-
-	io.Copy(dirBuffer, rsp.Body)
-
-	sizes := parseList(dirBuffer.ToString())
-
-	var de []fuse.DirEntry
-
-	cz, err := goquery.NewDocumentFromReader(dirBuffer)
-	if err != nil {
-		yo.Fatal(err)
-	}
-
-	ttl := ""
-
-	cz.Find("title").Each(func(i int, s *goquery.Selection) {
-		ttl = s.Text()
-	})
-
-	if !strings.HasPrefix(ttl, "Index of ") {
-		return nil, fuse.ENOENT
-	}
-
-	cz.Find("a").Each(func(i int, s *goquery.Selection) {
-		yo.Println("warn", s.Text())
-		u, ok := s.Attr("href")
-		if !ok {
-			yo.Fatal("No href attribute on a?")
-			return
-		}
-
-		lastU, err := url.QueryUnescape(u)
-		if err != nil {
-			yo.Fatal(err)
-			return
-		}
-
-		nname := lastU
-
-		if s.Text() != "../" {
-			if strings.HasSuffix(nname, "/") {
-				nname = strings.TrimRight(nname, "/")
-				if name == "" {
-					me.sizes.Store(nname, int64(-1))
-				} else {
-					me.sizes.Store(name+"/"+nname, int64(-1))
-				}
-				de = append(de, fuse.DirEntry{
-					Name: nname,
-					Mode: fuse.S_IFDIR,
-				})
-
-			} else {
-				me.sizes.Store(name+"/"+nname, sizes[i])
-				de = append(de, fuse.DirEntry{
-					Name: nname,
-					Mode: fuse.S_IFREG,
-				})
-			}
-		}
-	})
-
-	yo.Println("(OpenDir)", spew.Sdump(de))
-
-	return de, fuse.OK
+	// Return FOPEN_DIRECT_IO so content is not cached.
+	return fh, fuse.FOPEN_DIRECT_IO, 0
 }
 
-func (me *IndexFS) Open(name string, flags uint32, context *fuse.Context) (file nodefs.File, code fuse.Status) {
-	g := me.head(me.hpath + "/" + name)
-	yo.Println("(Open)", name, g)
-	if g < 0 {
-		return nil, fuse.ENOENT
-	}
-
-	if flags&fuse.O_ANYWRITE != 0 {
-		return nil, fuse.EPERM
-	}
-
-	f := new(hFile)
-	f.url = me.hpath + "/" + name
-	f.c = me.c
-	f.size = g
-	f.File = nodefs.NewDefaultFile()
-
-	return f, fuse.OK
-}
+var _ = (fs.NodeLookuper)((*urlNode)(nil))
+var _ = (fs.NodeOpener)((*urlNode)(nil))
 
 func main() {
-	pflag.Parse()
-	if len(pflag.Args()) < 1 {
-		yo.Fatal("Usage: http-index-fs (http url) (mount point)")
+	verbose := flag.Bool("v", false, "Verbose")
+	debug := flag.Bool("debug", false, "Debug FUSE")
+	flat := flag.Bool("flat", false, "Consider there is no directories (one level hierarchy only)")
+	extensions := flag.Bool("extensions", false, "Consider directories are the files without extension")
+	flag.Parse()
+	if len(flag.Args()) < 1 {
+		log.Fatal("Usage: http-config-fs <http url> <mount point>")
+		os.Exit(1)
 	}
 
-	exec.Command("/bin/fusermount", "-uz", pflag.Arg(1)).Run()
+	logv = log.New(os.Stderr, "[verbose] ", log.LstdFlags)
+	logd = log.New(os.Stderr, "[debug] ", log.LstdFlags)
+	if !*verbose {
+		logv.SetOutput(ioutil.Discard)
+	}
+	if !*debug {
+		logd.SetOutput(ioutil.Discard)
+	}
 
-	srcURL, err := url.Parse(pflag.Arg(0))
+	exec.Command("/bin/fusermount", "-uz", flag.Arg(1)).Run()
+
+	srcURL, err := url.Parse(flag.Arg(0))
 	if err != nil {
-		yo.Fatal(err)
+		log.Fatal(err)
 	}
 
-	if strings.HasSuffix(srcURL.Path, "/") {
-		srcURL.Path = strings.TrimRight(srcURL.Path, "/")
+	HttpClientNoRedirects = &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Allow https redirects
+			if req.URL.Scheme == "https" && via[len(via)-1].URL.Scheme == "http" {
+				return nil
+			}
+			// Block other redirects
+			return http.ErrUseLastResponse
+		},
 	}
 
-	yo.Println("Mounting", srcURL, "to", pflag.Arg(1))
-	nfs := pathfs.NewPathNodeFs(&IndexFS{
-		sizes:      new(sync.Map),
-		FileSystem: pathfs.NewDefaultFileSystem(),
-		hpath:      srcURL.String(),
-		c:          &http.Client{},
-	}, nil)
+	root := &urlNode{
+		URL:        srcURL,
+		Flat:       *flat,
+		Extensions: *extensions,
+	}
+	mntDir := flag.Arg(1)
 
-	server, _, err := nodefs.MountRoot(pflag.Arg(1), nfs.Root(), nil)
+	log.Printf("Mounting %v to %s", root.URL, mntDir)
+	server, err := fs.Mount(mntDir, root, &fs.Options{
+		MountOptions: fuse.MountOptions{
+			// Set to true to see how the file system works.
+			Debug: *debug,
+		},
+	})
 	if err != nil {
-		yo.Fatal("Mount fail:", err)
+		log.Println(err)
+		os.Exit(1)
 	}
+	log.Printf("Unmount by calling 'fusermount -u %s'", mntDir)
 
-	server.Serve()
+	// Wait until unmount before exiting
+	server.Wait()
 }
