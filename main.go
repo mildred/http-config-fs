@@ -67,6 +67,7 @@ type urlNode struct {
 	fs.Inode
 	Flat       bool
 	Extensions bool
+	File       *string
 	URL        *url.URL
 }
 
@@ -76,6 +77,15 @@ func (n *urlNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	url, err := n.URL.Parse(name)
 	if err != nil {
 		return nil, syscall.ENOENT
+	}
+
+	if n.File != nil && *n.File == name {
+		return n.NewInode(ctx, &urlNode{
+			URL:  n.URL,
+			Flat: true,
+		}, fs.StableAttr{
+			Mode: fuse.S_IFREG,
+		}), 0
 	}
 
 	var mode uint32 = fuse.S_IFREG
@@ -98,7 +108,11 @@ func (n *urlNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	stable := fs.StableAttr{
 		Mode: mode,
 	}
-	operations := &urlNode{URL: url}
+	operations := &urlNode{
+		URL:        url,
+		Flat:       n.Flat,
+		Extensions: n.Extensions,
+	}
 
 	// The NewInode call wraps the `operations` object into an Inode.
 	child := n.NewInode(ctx, operations, stable)
@@ -144,6 +158,7 @@ func main() {
 	debug := flag.Bool("debug", false, "Debug FUSE")
 	flat := flag.Bool("flat", false, "Consider there is no directories (one level hierarchy only)")
 	extensions := flag.Bool("extensions", false, "Consider directories are the files without extension")
+	file := flag.String("file", "", "Export a single URL as this file name under mount path")
 	flag.Parse()
 	if len(flag.Args()) < 1 {
 		log.Fatal("Usage: http-config-fs <http url> <mount point>")
@@ -181,6 +196,7 @@ func main() {
 		URL:        srcURL,
 		Flat:       *flat,
 		Extensions: *extensions,
+		File:       file,
 	}
 	mntDir := flag.Arg(1)
 
